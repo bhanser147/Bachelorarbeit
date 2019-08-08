@@ -1,0 +1,264 @@
+using DataFrames
+using Distributions
+using Random, Flux
+using Plots
+
+function design(n) #generiert Datensatz mit n Patienten
+    #Variablen initialisieren
+    x_G1 = rand(n)
+    x_G2 = rand(n)
+    A = rand(n)
+    x = rand(n, 10) #x_1 bis x_10
+    yC = zeros(n)
+    yE = zeros(n)
+    y = rand(n)
+
+    for i = 1:n
+        x_G1[i] = Int.(bitrand(1))[1] #P(x_G1 = 1) = 1/2
+        x_G2[i] = Int.(bitrand(1))[1] #P(x_G2 = 1) = 1/2
+    end
+
+    for i = 1:n
+        for j = 1:5 #x_1 - x_5 bekommen ihre Wahrscheinlichkeiten zugewiesen
+            if x_G1[i] == 0 #Wenn x_G1 = 0, hat die Person eher keine Störfaktoren
+                 x[i,j] = rand(Bernoulli(0.2),1)[1] #P(x_i)
+                 A[i] = rand(Bernoulli(0.8),1)[1]
+             else
+                 x[i,j] = rand(Bernoulli(0.8),1)[1]
+                 A[i] = rand(Bernoulli(0.2),1)[1]
+                 yC[i] = 0.5
+             end
+         end
+         for j = 6:10 #x_6-x_10 bekommen ihre Wahrscheinlichkeiten zugewiesen
+            if x_G2[i] == 0 #Wenn x_G2 = 0, hat die Person eher keine Effektmodifikatoren
+                 x[i,j] = rand(Bernoulli(0.2),1)[1]
+             else
+                 x[i,j] = rand(Bernoulli(0.8),1)[1]
+             end
+        end
+        if (sum(x[i,j] for j = 6:10)>2)
+            yE[i] = A[i]*0.5 #Outcome wird erhöht durch Effektmodifikatoren
+        end
+        if A[i] == 0
+            y[i]=rand(Normal(0,1))
+        else
+            y[i]=rand(Normal(1,1))
+        end
+        y[i] = y[i] + yE[i] + yC[i] #Gesamtoutcome
+    end
+    return x, y, x_G1, x_G2, A
+end
+
+binsum(v) = Int(v[1] + v[2]*2 + v[3]*4 + v[4]*8 + v[5]*16)
+
+function GewichtNN(n)
+#Ergebnis ist P(A = a) / P(a = 1, L = l) stabilisierte Inverse-Probability-Gewichte
+    x, y, x_G1, x_G2, A = design(n)
+
+    data = Vector(undef, n)
+
+    weights = Chain(Dense(5, 5, relu), Dense(5,1,relu))  #Neuronales Netz, welches bedingte Wahrscheinlichkeit berechnet
+    loss(x, y) = Flux.mse(weights(x), y)
+
+    #Anzahl pro Kombination von Störfaktoren von A = 1 und A = 0
+    counter_treatment = zeros(32)
+    counter_notreatment = zeros(32)
+
+    x1_5 = x[:,1:5]
+
+    for i in 1:n #
+        if A[i] == 1
+            counter_treatment[binsum(x1_5[i,:]) + 1] += 1
+        else
+            counter_notreatment[binsum(x1_5[i,:]) + 1] += 1
+        end
+    end
+
+    pA0L = Vector(undef, 32)
+
+    for i in 1:32
+        if (counter_notreatment[i] + counter_treatment[i]) > 0
+            pA0L[i] = counter_notreatment[i]/(counter_notreatment[i] + counter_treatment[i])
+        else
+            pA0L[i] = 0
+        end
+    end
+
+
+    for i = 1:n
+        if A[i] == 1
+            data[i] = (x[i,1:5], 1 - pA0L[binsum(x1_5[i,:]) + 1])
+        else
+            data[i] = (x[i,1:5], pA0L[binsum(x1_5[i,:]) + 1])
+    end
+
+    params = Flux.params(weights)
+    opt = Descent(0.01)
+
+    Flux.@epochs 20 Flux.train!(loss, params, data, opt)
+
+    return weights
+end
+
+h(x) = exp.(-x) #APproximation der Indikatorfunktion
+j(x,z) = (2*x.-1).*(sign.(z .- 0.5))
+loss2(x, y, z) = sum((h1(j(x,z)).*y) ./ ((x*(sum(x)/length(x))) + ((ones(length(x)) .- x)*(1 - sum(x)/length(x))))) / length(x)
+
+function nn(n)#Neuronale Netzwerke NN und NN_W
+x, y, x_G1, x_G2, A = design(n)
+
+#weights = GewichtNN(n, x, A)
+weights = GewichtNN(n)
+W = Vector(undef, n)
+for i in 1:n
+    W[i] = Tracker.data(weights(x[i,1:5]))[1]
+end
+
+data = Vector(undef, n)
+dataw = Vector(undef, n)
+
+NN = Chain(Dense(10,10,relu), Dense(10,1,relu))
+NN_w = Chain(Dense(10,10,relu), Dense(10,1,relu))
+
+
+for i in 1:n
+    data[i] = ([A[i]],[y[i]], x[i,:])
+    dataw[i] = ([A[i]],[y[i]*W[i]], x[i,:])
+end
+
+L(x, y, z) = loss2(x, y, model(z))
+opt = Descent(0.01)
+params = Flux.params(NN)
+paramsw = Flux.params(NN_w)
+
+Flux.@epochs 50 Flux.train!(L, params, data, opt)
+Flux.@epochs 50 Flux.train!(L, paramsw, dataw, opt)
+
+    return model, modelw
+end
+
+function m(x, y, x_G1, x_G2, A, model, model1) #berechnet Mittelwert und Differenzen der Mittelwerte
+    n = length(x_G1)
+    sx_G1 = (sum(x_G1))
+    sx_G2 = (sum(x_G2))
+    a, b, c, d, e, f, g, h = 0, 0, 0, 0, 0, 0, 0, 0
+
+    d_G1_A_0, d_G1_A_1, d_G2_A_0, d_G2_A_1 = 0, 0, 0, 0
+    m_x_G1_0_A_0 = Vector(undef, 0)
+    m_x_G1_0_A_1 = Vector(undef, 0)
+    m_x_G1_1_A_0 = Vector(undef, 0)
+    m_x_G1_1_A_1 = Vector(undef, 0)
+    mw_x_G1_0_A_0 = Vector(undef, 0)
+    mw_x_G1_0_A_1 = Vector(undef, 0)
+    mw_x_G1_1_A_0 = Vector(undef, 0)
+    mw_x_G1_1_A_1 = Vector(undef, 0)
+    m_x_G2_0_A_0 = Vector(undef, 0)
+    m_x_G2_0_A_1 = Vector(undef, 0)
+    m_x_G2_1_A_0 = Vector(undef, 0)
+    m_x_G2_1_A_1 = Vector(undef, 0)
+    mw_x_G2_0_A_0 = Vector(undef, 0)
+    mw_x_G2_0_A_1 = Vector(undef, 0)
+    mw_x_G2_1_A_0 = Vector(undef, 0)
+    mw_x_G2_1_A_1 = Vector(undef, 0)
+
+    m_G1_0_w_A_0, m_G1_0_w_A_1, m_G1_0_wa_A_0, m_G1_0_wa_A_1 = 0, 0, 0, 0
+    m_G1_1_w_A_0, m_G1_1_w_A_1, m_G1_1_wa_A_0, m_G1_1_wa_A_1 = 0, 0, 0, 0
+    m_G1_0_A_0, m_G1_0_A_1 = 0, 0
+    m_G1_1_A_0, m_G1_1_A_1 = 0, 0
+    m_G2_0_w_A_0, m_G2_0_w_A_1, m_G2_0_wa_A_0, m_G2_0_wa_A_1 = 0, 0, 0, 0
+    m_G2_1_w_A_0, m_G2_1_w_A_1, m_G2_1_wa_A_0, m_G2_1_wa_A_1 = 0, 0, 0, 0
+    m_G2_0_A_0, m_G2_0_A_1 = 0, 0
+    m_G2_1_A_0, m_G2_1_A_1  = 0, 0
+
+
+    for i in 1:n
+        if A[i]==0
+            if x_G1[i] == 0
+                m_G1_0_A_0 += Tracker.data(model(x[i,:]))[1]
+                m_G1_0_w_A_0 += Tracker.data(model1(x[i,:]))[1]
+                a += 1
+            else
+                m_G1_1_A_0 += Tracker.data(model(x[i,:]))[1]
+                m_G1_1_w_A_0 += Tracker.data(model1(x[i,:]))[1]
+                b +=1
+            end
+            if x_G2[i] == 0
+                m_G2_0_A_0 += Tracker.data(model(x[i,:]))[1]
+                m_G2_0_w_A_0 += Tracker.data(model1(x[i,:]))[1]
+                c += 1
+            else x_G2[i] == 1
+                m_G2_1_A_0 += Tracker.data(model(x[i,:]))[1]
+                m_G2_1_w_A_0 += Tracker.data(model1(x[i,:]))[1]
+                d += 1
+            end
+        else
+            if x_G1[i] == 0
+                m_G1_0_A_1 += Tracker.data(model(x[i,:]))[1]
+                m_G1_0_w_A_1 += Tracker.data(model1(x[i,:]))[1]
+                e += 1
+            else
+                m_G1_1_A_1 += Tracker.data(model(x[i,:]))[1]
+                m_G1_1_w_A_1 += Tracker.data(model1(x[i,:]))[1]
+                f += 1
+            end
+            if x_G2[i] == 0
+                m_G2_0_A_1 += Tracker.data(model(x[i,:]))[1]
+                m_G2_0_w_A_1 += Tracker.data(model1(x[i,:]))[1]
+                g += 1
+            else x_G2[i] == 1
+                m_G2_1_A_1 += Tracker.data(model(x[i,:]))[1]
+                m_G2_1_w_A_1 += Tracker.data(model1(x[i,:]))[1]
+                h += 1
+            end
+        end
+    end
+     d_G1_A_0 = abs(m_G1_0_A_0/a-m_G1_1_A_0/b)-abs(m_G1_0_w_A_0/a- m_G1_1_w_A_0/b)
+     d_G1_A_1 = abs(m_G1_0_A_1/e-m_G1_1_A_1/f)-abs(m_G1_0_w_A_1/e- m_G1_1_w_A_1/f)
+     d_G2_A_0 = abs(m_G2_0_A_0/c-m_G2_1_A_0/d)-abs(m_G2_0_w_A_0/c- m_G2_1_w_A_0/d)
+     d_G2_A_1 = abs(m_G2_0_A_1/g-m_G2_1_A_1/h)-abs(m_G2_0_w_A_1/g- m_G2_1_w_A_1/h)
+
+    m= [abs(m_G1_0_A_0/a-m_G1_1_A_0/b) abs(m_G1_0_w_A_0/a-m_G1_1_w_A_0/b) d_G1_A_0 abs(m_G2_0_A_0/c-m_G2_1_A_0/d) abs(m_G2_0_w_A_0/c-m_G2_1_w_A_0/d) d_G2_A_0; abs(m_G1_0_A_1/e-m_G1_1_A_1/f) abs( m_G1_0_w_A_1/e-m_G1_1_w_A_1/f) d_G1_A_1 abs(m_G2_0_A_1/g-m_G2_1_A_1/h) abs(m_G2_0_w_A_1/g-m_G2_1_w_A_1/h) d_G2_A_1]
+
+    return m
+end
+
+function f(a, b, c)
+
+  #= a = Anzahl wie oft das Netz trainiert wird,
+    b = Fallzahl fürs Training,
+    c = Fallzahl fürs Auswerten =#
+    d1 = zeros(2,6)
+    s1 = zeros(1, 8)
+    for i in 1:a
+      println("Das ist die ", i, ".te Wiederholung, für n=", b)
+      model, modelw = nn(b)
+      x, y, x_G1, x_G2, A = design(c)
+      e = m(x, y, x_G1, x_G2, A, model, modelw)
+      for i in 1:2
+        for j in 1:6
+            d1[i, j] += e[i, j]
+        end
+      end
+    end
+    return d1/a
+end
+
+#Ausführung des Programms
+ d100 = f(20, 100, 100)
+ d1000 = f(20, 1000, 100)
+ d10000 = f(20, 10000, 100)
+dA0 = zeros(1, 6)
+dA0[1,:] = d10[1,:]
+dA0[2,:] = d1000[1,:]
+dA0[3,:] = d10000[1,:]
+
+dA1 = zeros(1, 6)
+dA1[1,:] = d10[2,:]
+dA1[2,:] = d1000[2,:]
+dA1[3,:] = d10000[2,:]
+
+dfm0 = convert(DataFrame, dA0)
+println("A = 0", dfm0)
+
+dfm1 = convert(DataFrame, dA1)
+println("A = 1", dfm1)
